@@ -3,6 +3,7 @@ import re
 import yara
 import hashlib
 import requests
+import time
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
@@ -14,33 +15,20 @@ from models import db, ScanLog
 # 1. Basic Configuration
 # --------------------
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
 app.config['SECRET_KEY'] = 'your_secret_key_here'
-
-# Set BASE_DIR to the directory where app.py resides
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Define the default YARA rules file path (for default scanning and rule counting)
 DEFAULT_RULES_PATH = os.path.join(BASE_DIR, 'rules', 'malware_rules.yar')
-
-# Directory to store uploaded files
 app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'uploads')
 if not os.path.exists(app.config['UPLOAD_FOLDER']):
     os.makedirs(app.config['UPLOAD_FOLDER'])
-
-# Configure the SQLite database
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(BASE_DIR, 'scan_logs.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-# Initialize the database with the app
 db.init_app(app)
 with app.app_context():
     db.create_all()
 
-# --------------------
-# 2. Utility Functions and Constants
-# --------------------
 ALLOWED_EXTENSIONS = {'exe', 'yar', 'yara'}
 
 def allowed_file(filename, exts):
@@ -52,9 +40,6 @@ def log_scan(filename, scan_type, result):
     db.session.commit()
 
 def generate_yara_rule(rule_name, strings, condition_operator="and"):
-    """
-    Build a simple YARA rule from provided strings.
-    """
     rule = f"rule {rule_name} {{\n"
     rule += "    strings:\n"
     for idx, s in enumerate(strings):
@@ -65,47 +50,50 @@ def generate_yara_rule(rule_name, strings, condition_operator="and"):
     return rule
 
 # --- External Integration: VirusTotal API ---
-VIRUSTOTAL_API_KEY = os.getenv("API_KEY")   # Replace with your VirusTotal API key
+VIRUSTOTAL_API_KEY = os.getenv("API_KEY")
 VIRUSTOTAL_URL = "https://www.virustotal.com/api/v3/files"
-if not VIRUSTOTAL_API_KEY:
-    raise ValueError("API Key not found. Please set API_KEY in .env file.")
+print("API_KEY:", VIRUSTOTAL_API_KEY)
 
-print("API Key Loaded Successfully")
 def get_virustotal_score(file_path):
-    """
-    Computes the SHA256 hash of the file and sends it to VirusTotal.
-    Returns a threat score (0-100) based on the ratio of malicious detections.
-    """
     headers = {"x-apikey": VIRUSTOTAL_API_KEY}
     try:
         with open(file_path, "rb") as f:
             file_bytes = f.read()
         file_hash = hashlib.sha256(file_bytes).hexdigest()
-        # For a real implementation, you might first check if this hash was already analyzed.
-        files = {"file": file_bytes}
-        response = requests.post(VIRUSTOTAL_URL, headers=headers, files={"file": f})
+        import io
+        file_stream = io.BytesIO(file_bytes)
+        response = requests.post(VIRUSTOTAL_URL, headers=headers, files={"file": file_stream})
         if response.status_code == 200:
             data = response.json()
-            stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-            malicious = stats.get("malicious", 0)
-            total = sum(stats.values()) if stats else 0
-            score = (malicious / total) * 100 if total > 0 else 0
-            return round(score, 2)
+            analysis_id = data.get("data", {}).get("id")
+            if not analysis_id:
+                return {"score": 0, "stats": {}}
+            analysis_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+            for _ in range(10):
+                poll_response = requests.get(analysis_url, headers=headers)
+                if poll_response.status_code == 200:
+                    poll_data = poll_response.json()
+                    status = poll_data.get("data", {}).get("attributes", {}).get("status", "")
+                    if status == "completed":
+                        stats = poll_data.get("data", {}).get("attributes", {}).get("stats", {})
+                        malicious = stats.get("malicious", 0)
+                        total = sum(stats.values()) if stats else 0
+                        score = (malicious / total) * 100 if total > 0 else 0
+                        return {"score": round(score, 2), "stats": stats}
+                time.sleep(2)
+            print("Analysis did not complete in time.")
+            return {"score": 0, "stats": {}}
         else:
             print(f"VirusTotal API error: {response.status_code} - {response.text}")
-            return 0
+            return {"score": 0, "stats": {}}
     except Exception as e:
         print(f"Error querying VirusTotal: {e}")
-        return 0
+        return {"score": 0, "stats": {}}
 
 def count_yara_rules(yara_file_path):
-    """
-    Count the number of rule definitions in a YARA file using a regex.
-    """
     try:
         with open(yara_file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        # Matches lines starting with "rule" followed by a word and a '{'
         rules = re.findall(r'(?m)^\s*rule\s+\w+\s*\{', content)
         return len(rules) if len(rules) > 0 else 1
     except Exception as e:
@@ -115,21 +103,13 @@ def count_yara_rules(yara_file_path):
 TOTAL_YARA_RULES = count_yara_rules(DEFAULT_RULES_PATH)
 
 def calculate_vulnerability_score(yara_matches, vt_score):
-    """
-    Calculates an internal vulnerability score based on YARA matches.
-    Each rule is weighted evenly over the total number of rules.
-    Then combines the YARA score and VirusTotal score (simple average).
-    """
     per_rule_weight = 100 / TOTAL_YARA_RULES
     yara_score = len(yara_matches) * per_rule_weight
     total_score = (yara_score + vt_score) / 2
     return round(total_score, 2)
 
-# --------------------
-# 3. API Endpoints
-# --------------------
+# (Other endpoints A, B, C, and D remain unchanged)
 
-# A) Scan an uploaded .exe using default YARA rules (without external API)
 @app.route('/api/scan_default', methods=['POST'])
 def scan_default():
     if 'file' not in request.files:
@@ -154,6 +134,7 @@ def scan_default():
 
     log_scan(filename, "default", result_text)
     return jsonify({'result': result_text})
+
 
 # B) Scan using a custom YARA rule file
 @app.route('/api/scan_custom', methods=['POST'])
@@ -209,7 +190,8 @@ def get_logs():
     logs = ScanLog.query.order_by(ScanLog.timestamp.desc()).all()
     return jsonify([log.to_dict() for log in logs])
 
-# E) Combined Scan: Use default YARA rules, then query VirusTotal and calculate a vulnerability rating
+
+# E) Combined Scan: YARA + VirusTotal + Detailed Analysis
 @app.route('/api/scan', methods=['POST'])
 def scan_file():
     if 'file' not in request.files:
@@ -234,23 +216,20 @@ def scan_file():
         yara_matches = [match.rule for match in results]
     except Exception as e:
         print("Error scanning with YARA:", e)
-
-    # Query VirusTotal for an external threat score
-    vt_score = get_virustotal_score(file_path)
-
-    # Calculate final vulnerability score
+    vt_result = get_virustotal_score(file_path)
+    vt_score = vt_result["score"]
+    vt_stats = vt_result["stats"]
     vulnerability_score = calculate_vulnerability_score(yara_matches, vt_score)
-
-    result = {
+    combined_result = {
         "file": filename,
         "yara_matches": yara_matches,
         "virustotal_score": vt_score,
+        "vt_stats": vt_stats,
         "vulnerability_score": vulnerability_score
     }
-    return jsonify(result)
+    import json
+    log_scan(filename, "detailed", json.dumps(combined_result))
+    return jsonify(combined_result)
 
-# --------------------
-# 4. Run the App
-# --------------------
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
