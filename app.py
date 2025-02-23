@@ -25,9 +25,9 @@ from models import db, User, ScanLog
 app = Flask(__name__)
 CORS(app)
 
-app.config['SECRET_KEY'] = 'your_secret_key_here'
-app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_here'
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # Limit uploads to 10MB
+app.config['SECRET_KEY'] = os.getenv("SECRET_KEY")
+app.config['JWT_SECRET_KEY'] = os.getenv("JWT_SECRET_KEY")
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # Limit uploads to 10MB
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RULES_PATH = os.path.join(BASE_DIR, 'rules', 'malware_rules.yar')
@@ -254,31 +254,47 @@ def scan_file():
     uploaded_file.save(file_path)
     
     user_api_key = request.form.get("api_key")
+
+    try:
+        with open(DEFAULT_RULES_PATH, 'r', encoding='utf-8') as f:
+            huge_rules_content = f.read()
+    except Exception as e:
+        return jsonify({"error": f"Could not read YARA rules file: {str(e)}"}), 500
+
     
+    import re
+    rule_blocks = re.findall(r'(?s)(rule\s+\w+\s*\{.*?\})', huge_rules_content)
+    total_rules = len(rule_blocks)
+    processed_rules = 0
     # Perform YARA scanning on all files
     yara_matches = []
     risk_factors = {}
-    try:
-        rules = yara.compile(filepath=DEFAULT_RULES_PATH)
-        results = rules.match(file_path)
-        yara_matches = [match.rule for match in results]
-        for match in results:
-            if hasattr(match, 'strings'):
-                risk_factors[match.rule] = []
-                for s in match.strings:
-                    try:
-                        risk_factors[match.rule].append(s.data)
-                        continue
-                    except AttributeError:
-                        pass
-                    try:
-                        risk_factors[match.rule].append(s[2])
-                        continue
-                    except (TypeError, IndexError):
-                        pass
-                    risk_factors[match.rule].append(str(s))
-    except Exception as e:
-        print("Error scanning with YARA:", e)
+    for block in rule_blocks:
+        processed_rules += 1
+        try:
+            compiled_rule = yara.compile(source=block)
+            results = compiled_rule.match(file_path)
+            if results:
+                for match in results:
+                    if match.rule not in yara_matches:
+                        yara_matches.append(match.rule)
+                    # Gather risk factor details if available.
+                    if hasattr(match, 'strings'):
+                        if match.rule not in risk_factors:
+                            risk_factors[match.rule] = []
+                        for s in match.strings:
+                            try:
+                                risk_factors[match.rule].append(s.data)
+                            except AttributeError:
+                                try:
+                                    risk_factors[match.rule].append(s[2])
+                                except (TypeError, IndexError):
+                                    risk_factors[match.rule].append(str(s))
+        except Exception as e:
+            # Log per-rule errors but continue scanning.
+            print(f"Error processing rule: {e}")
+
+    progress_str = f"{processed_rules}/{total_rules} rules scanned"
     
     vt_result = get_virustotal_score(file_path, provided_api_key=user_api_key)
     vt_score = vt_result["score"]
@@ -295,7 +311,8 @@ def scan_file():
         "virustotal_score": vt_score,
         "vt_stats": vt_stats,
         "vulnerability_score": vulnerability_score,
-        "verdict": verdict
+        "verdict": verdict,
+        "progress": progress_str
     }
     
     log_scan(filename, "detailed", json.dumps(combined_result), user_id=current_user)
