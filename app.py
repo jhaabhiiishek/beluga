@@ -89,6 +89,7 @@ def get_virustotal_score(file_path, provided_api_key=None):
                     poll_data = poll_response.json()
                     status = poll_data.get("data", {}).get("attributes", {}).get("status", "")
                     if status == "completed":
+                        print("completed")
                         stats = poll_data.get("data", {}).get("attributes", {}).get("stats", {})
                         malicious = stats.get("malicious", 0)
                         total = sum(stats.values()) if stats else 0
@@ -160,7 +161,6 @@ def login():
 # --------------------
 # 5. Protected API Endpoints (Require Authentication)
 # --------------------
-# A) Default Scan (for EXE only)
 @app.route('/api/scan_default', methods=['POST'])
 @jwt_required()
 def scan_default():
@@ -168,20 +168,63 @@ def scan_default():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
-    if file.filename == '' or not allowed_file(file.filename, {'exe','pdf','docx','yar','yara'}):
+    if file.filename == '' or not allowed_file(file.filename, {'exe', 'pdf', 'docx', 'yar', 'yara'}):
         return jsonify({'error': 'No selected file or invalid file type'}), 400
     filename = secure_filename(file.filename)
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
+    
     try:
-        print("Using YARA rules from:", DEFAULT_RULES_PATH)
-        rules = yara.compile(filepath=DEFAULT_RULES_PATH)
-        results = rules.match(file_path)
-        matches = [match.rule for match in results]
-        result_text = f"Matches: {matches}" if results else "No malicious patterns detected. Safe ✅  \n(For detailed analysis use detailed Scan)"
+        with open(DEFAULT_RULES_PATH, 'r', encoding='utf-8') as f:
+            huge_rules_content = f.read()
     except Exception as e:
-        print("Exception during scan:", e)
-        result_text = f"Error scanning file: {str(e)}"
+        return jsonify({"error": f"Could not read YARA rules file: {str(e)}"}), 500
+
+    import re
+    # Split huge YARA content into individual rule blocks
+    rule_blocks = re.findall(r'(?s)(rule\s+\w+\s*\{.*?\})', huge_rules_content)
+    total_rules = len(rule_blocks)
+    processed_rules = 0
+    yara_matches = []
+    risk_factors = {}
+    
+    for block in rule_blocks:
+        processed_rules += 1
+        try:
+            # Use the "source" keyword to compile the rule block
+            compiled_rule = yara.compile(source=block)
+            results = compiled_rule.match(file_path)
+            if results:
+                for match in results:
+                    if match.rule not in yara_matches:
+                        yara_matches.append(match.rule)
+                    if hasattr(match, 'strings'):
+                        if match.rule not in risk_factors:
+                            risk_factors[match.rule] = []
+                        for s in match.strings:
+                            try:
+                                risk_factors[match.rule].append(s.data)
+                            except AttributeError:
+                                try:
+                                    risk_factors[match.rule].append(s[2])
+                                except (TypeError, IndexError):
+                                    risk_factors[match.rule].append(str(s))
+        except Exception as e:
+            print(f"Error processing rule: {e}")
+
+    progress_str = f"{processed_rules}/{total_rules} rules scanned"
+    
+    # Compute a vulnerability score: percentage of matched rules relative to total rules
+    vulnerability_score = (len(yara_matches) * 100) / total_rules if total_rules > 0 else 0
+    verdict = "Malicious" if vulnerability_score >= 35 else "Safe ✅"
+    
+    result_text = (
+        f"Matches: {yara_matches}\n"
+        f"Risk Factors: {risk_factors}\n"
+        f"Progress: {progress_str}\n"
+        f"Verdict: {verdict} (Vulnerability Score: {vulnerability_score:.2f}%)"
+    )
+    
     log_scan(filename, "default", result_text, user_id=current_user)
     return jsonify({'result': result_text})
 
